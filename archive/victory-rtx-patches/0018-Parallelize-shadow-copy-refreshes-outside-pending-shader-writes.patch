@@ -1,0 +1,535 @@
+From 4e32f68e445afac66f64f77d98093e768958b204 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 11:36:14 +0100
+Subject: [PATCH] Parallelize shadow copy refreshes outside pending shader
+ writes
+
+Adapt the refresh worker pool from upstream commit 461d976 to the current shadow tracking implementation. Show fractional FPS in the window caption.
+---
+ crates/victory-gpu/src/copy_pool.rs | 281 ++++++++++++++++++++++++++++
+ crates/victory-gpu/src/host.rs      | 135 ++++++++++++-
+ crates/victory-gpu/src/lib.rs       |   2 +
+ crates/victory-gpu/src/shadow.rs    |  15 +-
+ 4 files changed, 423 insertions(+), 10 deletions(-)
+ create mode 100644 crates/victory-gpu/src/copy_pool.rs
+
+diff --git a/crates/victory-gpu/src/copy_pool.rs b/crates/victory-gpu/src/copy_pool.rs
+new file mode 100644
+index 0000000..1a32810
+--- /dev/null
++++ b/crates/victory-gpu/src/copy_pool.rs
+@@ -0,0 +1,281 @@
++//! A submission's refreshes, copied on several threads.
++//!
++//! Bringing host copies of title memory up to date is a memory copy, and
++//! one thread copies far below what the memory can move: on an RTX 5070 Ti
++//! host (DDR5), the world's ~8,800 scattered 64 KiB pages per frame
++//! (550 MB) took 60 ms on one thread, 43 on two and 37 on four, where the
++//! memory is saturated. A submission's refreshes ([`queued`]) queue their
++//! copies, and [`run`] copies them on a few workers with the submitting
++//! thread; it returns once all are done, so what follows sees them all.
++
++use std::cell::RefCell;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Condvar, Mutex, OnceLock};
++
++/// A copy of title memory into host memory: destination, source, bytes.
++pub(crate) type Piece = (usize, usize, usize);
++
++thread_local! {
++    static QUEUE: RefCell<Option<Vec<Piece>>> = const { RefCell::new(None) };
++}
++
++/// Runs `f`; the copies [`copy`] is asked for on this thread meanwhile are
++/// not made but returned, for [`run`].
++pub(crate) fn queued<R>(f: impl FnOnce() -> R) -> (R, Vec<Piece>) {
++    let outer = QUEUE.with(|q| q.replace(Some(Vec::new())));
++    let result = f();
++    let pieces = QUEUE.with(|q| q.replace(outer)).unwrap_or_default();
++    (result, pieces)
++}
++
++/// Copies `len` bytes of title memory at `src` into host memory at `dst`
++/// ([`crate::host::copy_mapped`]), or queues the copy inside [`queued`].
++/// The caller must keep the destination alive and wait for [`run`] before
++/// reading it. Queued destinations must not overlap.
++pub(crate) fn copy(dst: *mut u8, src: *const u8, len: usize) {
++    let piece = (dst as usize, src as usize, len);
++    let queued = QUEUE.with(|q| q.borrow_mut().as_mut().map(|q| q.push(piece)).is_some());
++    if !queued {
++        crate::host::copy_mapped(dst, src, len, false);
++    }
++}
++
++/// Copies are cut to this size, so that one big copy is shared too.
++const PIECE: usize = 1 << 20;
++/// Below this many bytes in all, one thread copies (waking the workers
++/// costs tens of microseconds; 4 MiB take about 0.4 ms).
++const PARALLEL_FROM: usize = 4 << 20;
++/// Workers besides the submitting thread: four threads saturated the
++/// memory above, eight gained 2%.
++const WORKERS: usize = 3;
++
++/// Tests: every copy on the calling thread (to compare with the workers).
++#[cfg(test)]
++pub(crate) static SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++fn serial() -> bool {
++    #[cfg(test)]
++    return SERIAL.load(Ordering::Relaxed);
++    #[cfg(not(test))]
++    false
++}
++
++/// Tests: the submitting thread leaves every piece to the workers, and the
++/// pieces they copied.
++#[cfg(test)]
++static WORKERS_ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++#[cfg(test)]
++static WORKER_PIECES: AtomicUsize = AtomicUsize::new(0);
++
++fn caller_helps() -> bool {
++    #[cfg(test)]
++    return !WORKERS_ALONE.load(Ordering::Relaxed);
++    #[cfg(not(test))]
++    true
++}
++
++/// Makes the copies [`queued`] returned, on several threads where they are
++/// many bytes; returns once all are made.
++pub(crate) fn run(pieces: Vec<Piece>) {
++    let total: usize = pieces.iter().map(|p| p.2).sum();
++    let pool = (total >= PARALLEL_FROM && !serial()).then(pool).flatten();
++    let Some(pool) = pool else {
++        for (dst, src, len) in pieces {
++            crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
++        }
++        return;
++    };
++    let mut cut = Vec::with_capacity(pieces.len() + total / PIECE);
++    for (dst, src, len) in pieces {
++        let mut at = 0;
++        while at < len {
++            let n = (len - at).min(PIECE);
++            cut.push((dst + at, src + at, n));
++            at += n;
++        }
++    }
++    pool.run(cut);
++}
++
++/// One [`run`]'s pieces, taken by index by whichever thread is free.
++struct Job {
++    pieces: Vec<Piece>,
++    next: AtomicUsize,
++    done: AtomicUsize,
++}
++
++impl Job {
++    /// Copies pieces until none are left to take (`worker`: on a worker).
++    #[cfg_attr(not(test), allow(unused_variables))]
++    fn work(&self, worker: bool) {
++        loop {
++            let i = self.next.fetch_add(1, Ordering::Relaxed);
++            let Some(&(dst, src, len)) = self.pieces.get(i) else {
++                return;
++            };
++            crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
++            #[cfg(test)]
++            if worker {
++                WORKER_PIECES.fetch_add(1, Ordering::Relaxed);
++            }
++            self.done.fetch_add(1, Ordering::Release);
++        }
++    }
++}
++
++struct Pool {
++    /// The current job and its number (workers take each job once).
++    job: Mutex<(u64, Option<Arc<Job>>)>,
++    wake: Condvar,
++    /// Signalled as workers finish their part of a job.
++    finished: Condvar,
++    /// One run at a time.
++    running: Mutex<()>,
++}
++
++impl Pool {
++    fn run(&self, pieces: Vec<Piece>) {
++        let _one = self.running.lock().unwrap_or_else(|e| e.into_inner());
++        let n = pieces.len();
++        let job = Arc::new(Job {
++            pieces,
++            next: AtomicUsize::new(0),
++            done: AtomicUsize::new(0),
++        });
++        {
++            let mut slot = self.job.lock().unwrap_or_else(|e| e.into_inner());
++            slot.0 += 1;
++            slot.1 = Some(job.clone());
++        }
++        self.wake.notify_all();
++        if caller_helps() {
++            job.work(false);
++        }
++        let mut slot = self.job.lock().unwrap_or_else(|e| e.into_inner());
++        while job.done.load(Ordering::Acquire) < n {
++            slot = self.finished.wait(slot).unwrap_or_else(|e| e.into_inner());
++        }
++        slot.1 = None;
++    }
++
++    fn worker(&self) {
++        let mut seen = 0;
++        loop {
++            let job = {
++                let mut slot = self.job.lock().unwrap_or_else(|e| e.into_inner());
++                loop {
++                    if slot.0 != seen
++                        && let Some(job) = &slot.1
++                    {
++                        seen = slot.0;
++                        break job.clone();
++                    }
++                    slot = self.wake.wait(slot).unwrap_or_else(|e| e.into_inner());
++                }
++            };
++            job.work(true);
++            // Under the lock, so the waiting thread cannot miss it.
++            let _slot = self.job.lock().unwrap_or_else(|e| e.into_inner());
++            self.finished.notify_all();
++        }
++    }
++}
++
++/// The workers, started on first use (None where threads cannot start).
++fn pool() -> Option<&'static Pool> {
++    static POOL: OnceLock<Option<&'static Pool>> = OnceLock::new();
++    *POOL.get_or_init(|| {
++        let pool: &'static Pool = Box::leak(Box::new(Pool {
++            job: Mutex::new((0, None)),
++            wake: Condvar::new(),
++            finished: Condvar::new(),
++            running: Mutex::new(()),
++        }));
++        let started = (0..WORKERS)
++            .filter(|i| {
++                std::thread::Builder::new()
++                    .name(format!("victory refresh {i}"))
++                    .spawn(move || pool.worker())
++                    .is_ok()
++            })
++            .count();
++        (started > 0).then_some(pool)
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Past the threshold the workers copy: with the submitting thread
++    /// leaving them every piece, they copy all of a run's pieces, and every
++    /// byte lands where it belongs.
++    #[test]
++    fn the_workers_take_the_pieces_past_the_threshold() {
++        let len = 8 << 20;
++        let src: Vec<u8> = (0..len).map(|i| (i * 13 + i / 65536) as u8).collect();
++        let mut dst = vec![0u8; len];
++        let (s, d) = (src.as_ptr(), dst.as_mut_ptr());
++        // 128 pieces of 64 KiB, in another order than in memory.
++        let ((), pieces) = queued(|| {
++            for k in 0..128usize {
++                let at = (k * 37 % 128) * (64 << 10);
++                // SAFETY: (both) inside the two buffers.
++                copy(unsafe { d.add(at) }, unsafe { s.add(at) }, 64 << 10);
++            }
++        });
++        assert!(pool().is_some(), "workers started");
++        WORKERS_ALONE.store(true, Ordering::Relaxed);
++        let before = WORKER_PIECES.load(Ordering::Relaxed);
++        run(pieces);
++        let copied = WORKER_PIECES.load(Ordering::Relaxed) - before;
++        WORKERS_ALONE.store(false, Ordering::Relaxed);
++        // At least: runs of other tests meanwhile count too.
++        assert!(copied >= 128, "pieces the workers copied: {copied}");
++        assert!(dst == src, "every byte where it belongs");
++    }
++
++    /// Queued copies are made by `run`, on the workers past the threshold,
++    /// one big copy cut into pieces too, each byte where it belongs.
++    #[test]
++    fn queued_copies_are_made_on_the_workers() {
++        let len = 24 << 20;
++        let src: Vec<u8> = (0..len).map(|i| (i * 7 + i / 4096) as u8).collect();
++        let mut dst = vec![0u8; len];
++        let (s, d) = (src.as_ptr(), dst.as_mut_ptr());
++        // Scattered 64 KiB pieces, then one 8 MiB copy.
++        let ((), pieces) = queued(|| {
++            for k in 0..128usize {
++                let at = (k * 37 % 256) * (64 << 10);
++                // SAFETY: (both) inside the two buffers.
++                copy(unsafe { d.add(at) }, unsafe { s.add(at) }, 64 << 10);
++            }
++            // SAFETY: inside the two buffers.
++            copy(
++                unsafe { d.add(16 << 20) },
++                unsafe { s.add(16 << 20) },
++                8 << 20,
++            );
++        });
++        assert_eq!(pieces.len(), 129, "queued, not made");
++        assert!(dst.iter().all(|&b| b == 0));
++        run(pieces);
++        let mut want = vec![0u8; len];
++        for k in 0..128usize {
++            let at = (k * 37 % 256) * (64 << 10);
++            want[at..at + (64 << 10)].copy_from_slice(&src[at..at + (64 << 10)]);
++        }
++        want[16 << 20..].copy_from_slice(&src[16 << 20..]);
++        assert!(dst == want, "every byte where it belongs");
++        // Outside `queued`, a copy is made at once.
++        copy(d, s, 16);
++        assert_eq!(dst[..16], src[..16]);
++        // Again, to reuse the workers.
++        // SAFETY: (both) inside the two buffers.
++        let (at, from) = unsafe { (d.add(1 << 20), s.add(1 << 20)) };
++        let (_, pieces) = queued(|| copy(at, from, 6 << 20));
++        dst[1 << 20..7 << 20].fill(0);
++        run(pieces);
++        assert!(dst[1 << 20..7 << 20] == src[1 << 20..7 << 20]);
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 5090083..144044e 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2118,19 +2118,30 @@ impl Batch {
+         self.current.clear();
+     }
+ 
+-    /// Does the refreshes; returns the bytes copied.
++    /// Does the refreshes; returns the bytes copied. Their copies of pages
++    /// no shader writes are made together at the end, on several threads
++    /// ([`crate::copy_pool`]); the time per range counts only finding them.
+     fn flush(&mut self) -> usize {
+         #[cfg(feature = "diagnostics")]
+         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
+         self.pending.clear();
++        let started = std::time::Instant::now();
++        let (total, pieces) = crate::copy_pool::queued(|| self.update_all());
++        crate::copy_pool::run(pieces);
++        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
++        total
++    }
++
++    /// [`Batch::flush`]'s updates, one per copy.
++    fn update_all(&mut self) -> usize {
+         let mut total = 0;
+         for (shadow, from, to) in self.refreshes.drain(..) {
+             let started = std::time::Instant::now();
+             let copied = shadow.update(from, to - from);
+-            let us = started.elapsed().as_micros() as u64;
+             #[cfg(feature = "diagnostics")]
+-            crate::copystat::range(from, to - from, us, 0);
+-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
++            crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
++            #[cfg(not(feature = "diagnostics"))]
++            let _ = started;
+             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+             total += copied;
+             // Kept: the union with what was current if they touch, else
+@@ -2893,7 +2904,7 @@ impl Meter {
+             self.caption = Some(buffer);
+         }
+         let Some(caption) = &self.caption else { return };
+-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
++        let text = format!(" | VIctory {fps:.1} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+         text.push(0);
+         // Setting the text waits for the window's thread (a title thread,
+@@ -3712,6 +3723,120 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at
+         crate::watch::tests::free(p);
+     }
+ 
++    /// A world frame's refreshes, on a made-up heap shaped like the world's
++    /// (#400): 36 submissions, each after the title wrote 256 scattered
++    /// pages of a 174 MB tracked heap, each declaring 24 ranges of it (of
++    /// 64 views) as written by marking shaders, refreshed through `Batch`
++    /// as `Host::execute` does (ranges armed, then one flush). Times the
++    /// flushes with the copies on one thread and on the workers
++    /// (`crate::copy_pool`), and checks every title write reached the copy.
++    /// Run with
++    /// `cargo test --release -p victory-gpu -- --ignored --nocapture world_frame_refreshes`.
++    #[test]
++    #[ignore = "benchmark"]
++    fn world_frame_refreshes() {
++        use crate::watch::PAGE;
++        use std::sync::atomic::Ordering;
++        use std::time::{Duration, Instant};
++        const HEAP: usize = 174 << 20;
++        const SUBMISSIONS: usize = 36;
++        const DECLARED: usize = 24;
++        const VIEWS: usize = 64;
++        const TITLE_PAGES: usize = 256;
++        const FRAMES: usize = 6;
++        let p = crate::watch::tests::pool(HEAP / PAGE);
++        crate::shadow::register(p, p as u64, HEAP as u64);
++        let Some(copy) = crate::shadow::find(p as u64, HEAP as u64) else {
++            crate::shadow::unregister(p, p as u64);
++            crate::watch::tests::free(p);
++            return; // no host GPU here
++        };
++        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
++        let mut next = move |n: usize| {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            (seed % n as u64) as usize
++        };
++        // Views of the heap: 256-byte aligned, 64 KiB to 32 MiB.
++        let views: Vec<(usize, usize)> = (0..VIEWS)
++            .map(|_| {
++                let len = (64 << 10) << next(10);
++                let at = next((HEAP - len) / 256) * 256;
++                (p + at, len)
++            })
++            .collect();
++        let mut batch = Batch::default();
++        batch.add(&copy, p, HEAP);
++        batch.flush();
++        let mut stamp = 1u64;
++        let mut frame = |serial: bool| -> (Duration, usize) {
++            crate::copy_pool::SERIAL.store(serial, Ordering::Relaxed);
++            let (mut took, mut copied) = (Duration::ZERO, 0);
++            for _ in 0..SUBMISSIONS {
++                let writes: Vec<usize> = (0..TITLE_PAGES)
++                    .map(|_| p + next(HEAP / PAGE) * PAGE + next(PAGE / 8) * 8)
++                    .collect();
++                for &at in &writes {
++                    // SAFETY: 8 aligned bytes of our pool.
++                    unsafe { (at as *mut u64).write_volatile(stamp) };
++                    stamp += 1;
++                }
++                let declared: Vec<(usize, usize)> =
++                    (0..DECLARED).map(|_| views[next(VIEWS)]).collect();
++                let mut batch = Batch::default();
++                for &(at, len) in &declared {
++                    batch.add(&copy, at, len);
++                    copy.writing(at, len, true);
++                }
++                let started = Instant::now();
++                copied += batch.flush();
++                took += started.elapsed();
++                // Every title write inside a declared range is in the copy.
++                for &at in &writes {
++                    if declared.iter().any(|&(a, n)| a <= at && at + 8 <= a + n) {
++                        // SAFETY: 8 aligned bytes of our pool.
++                        let title = unsafe { (at as *const u64).read_volatile() };
++                        let host = copy.read_host(at as u64, 2);
++                        assert_eq!(
++                            u64::from(host[0]) | u64::from(host[1]) << 32,
++                            title,
++                            "{at:#x}"
++                        );
++                    }
++                }
++                for &(at, len) in &declared {
++                    copy.copy_back(at, len);
++                }
++            }
++            (took, copied)
++        };
++        let mut report = |serial: bool| {
++            frame(serial);
++            let mut ms: Vec<f64> = (0..FRAMES)
++                .map(|_| {
++                    let (took, copied) = frame(serial);
++                    println!(
++                        "  {}: {:.1} ms, {} MB copied",
++                        if serial { "one thread" } else { "workers" },
++                        took.as_secs_f64() * 1e3,
++                        copied >> 20
++                    );
++                    took.as_secs_f64() * 1e3
++                })
++                .collect();
++            ms.sort_by(f64::total_cmp);
++            ms[FRAMES / 2]
++        };
++        let serial = report(true);
++        let workers = report(false);
++        println!("refresh per frame, median: one thread {serial:.1} ms, workers {workers:.1} ms");
++        crate::copy_pool::SERIAL.store(false, Ordering::Relaxed);
++        crate::shadow::unregister(p, p as u64);
++        drop(copy);
++        crate::watch::tests::free(p);
++    }
++
+     /// The hashing a submission does for textures in physical-page memory,
+     /// with every list checking the textures it samples (before) and with
+     /// each checked once (after). Run with
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index d7078b1..2a0a1f8 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -21,6 +21,8 @@ mod bindless;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod capture;
+ pub mod console;
++#[cfg(windows)]
++mod copy_pool;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod crumbs;
+ #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index e820969..1c0c9ed 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -542,7 +542,7 @@ impl Shadow {
+         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+         let mut copied = 0;
+         for (a, b) in runs {
+-            copied += self.copy(a, b);
++            copied += self.copy(a, b, false);
+             let (a, b) = (a - start, b - start);
+             for (at, bytes) in before.0.iter_mut() {
+                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+@@ -567,7 +567,7 @@ impl Shadow {
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+             // Cut to the range: next to it shaders may be writing the copy.
+-            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
++            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b, true)).sum();
+             #[cfg(feature = "diagnostics")]
+             {
+                 use crate::copystat::{C, add};
+@@ -579,7 +579,7 @@ impl Shadow {
+         }
+         #[cfg(feature = "diagnostics")]
+         let started = std::time::Instant::now();
+-        self.copy(from, to);
++        self.copy(from, to, true);
+         #[cfg(feature = "diagnostics")]
+         {
+             use crate::copystat::{C, add};
+@@ -590,12 +590,17 @@ impl Shadow {
+     }
+ 
+     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+-    fn copy(&self, from: usize, to: usize) -> usize {
++    /// Ranges with no pending shader writes can wait for the end of the batch.
++    fn copy(&self, from: usize, to: usize, defer: bool) -> usize {
+         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+         let (from, to) = (from.max(start), to.min(end));
+         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+         let at = unsafe { self.data.add(from - start) };
+-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
++        if defer {
++            crate::copy_pool::copy(at, from as *const u8, to - from);
++        } else {
++            crate::host::copy_mapped(at, from as *const u8, to - from, false);
++        }
+         to - from
+     }
+ }

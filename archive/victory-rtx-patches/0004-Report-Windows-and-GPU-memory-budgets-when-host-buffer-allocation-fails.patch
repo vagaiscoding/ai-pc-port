@@ -1,0 +1,119 @@
+From eda04747676e33a3c4767708fd9b4adee7a4a223 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Wed, 25 Nov 2026 14:31:00 +0100
+Subject: [PATCH] Report Windows and GPU memory budgets when host buffer
+ allocation fails
+
+---
+ crates/victory-gpu/src/host.rs | 73 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 70 insertions(+), 3 deletions(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 09314c3..54078a8 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -4,7 +4,7 @@
+ //! shortcut: every submission is waited for, so CPU and GPU never overlap;
+ //! overlap them with per-submission fences once more than clears run.
+ 
+-use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+ use std::sync::{Mutex, OnceLock};
+ use std::time::{Duration, Instant};
+ 
+@@ -304,6 +304,17 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn buffer_failure_reports_memory_pressure_without_exhausting_it() {
++        let (used, limit) = system_commit_mib().expect("Windows system commit counters");
++        assert!(used > 0 && used <= limit);
++        let Some(host) = host() else { return };
++        let error = windows::core::Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY);
++        host.report_buffer_failure("shared", 4 * 1024 * 1024, &error);
++        // SAFETY: a plain query of the live device after the diagnostics.
++        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
++    }
++
+     #[test]
+     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
+         let Some(host) = host() else { return };
+@@ -2251,11 +2262,67 @@ impl Host {
+         match made {
+             Ok(()) => Some((buffer?, data.cast())),
+             Err(e) => {
+-                tracing::warn!(error = %e, size, "no upload buffer");
++                self.report_buffer_failure("upload", size, &e);
+                 None
+             }
+         }
+     }
++
++    fn report_buffer_failure(&self, kind: &str, size: u64, error: &windows::core::Error) {
++        if error.code() != windows::Win32::Foundation::E_OUTOFMEMORY {
++            tracing::warn!(kind, size, %error, "Direct3D buffer allocation failed");
++            return;
++        }
++        static FAILURES: AtomicU64 = AtomicU64::new(0);
++        let failures = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
++        if !failures.is_power_of_two() {
++            return;
++        }
++        let commit = system_commit_mib();
++        // SAFETY: the live device supplies the adapter's identifier. Both calls
++        // only query DXGI objects and may fail after the device has been lost.
++        let adapter = unsafe {
++            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).and_then(|factory| {
++                factory.EnumAdapterByLuid::<IDXGIAdapter3>(self.device.GetAdapterLuid())
++            })
++        }
++        .ok();
++        let local = adapter.as_ref().and_then(|a| adapter_budget_mib(a, DXGI_MEMORY_SEGMENT_GROUP_LOCAL));
++        let non_local = adapter.as_ref().and_then(|a| adapter_budget_mib(a, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL));
++        tracing::warn!(
++            kind,
++            size,
++            failures,
++            %error,
++            system_commit_used_limit_mib = ?commit,
++            gpu_local_used_budget_mib = ?local,
++            gpu_non_local_used_budget_mib = ?non_local,
++            "Direct3D ran out of memory allocating a buffer"
++        );
++    }
++}
++
++fn system_commit_mib() -> Option<(usize, usize)> {
++    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
++    let mut info = PERFORMANCE_INFORMATION {
++        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
++        ..Default::default()
++    };
++    // SAFETY: the buffer and byte count describe a writable PERFORMANCE_INFORMATION.
++    let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
++    queried.then(|| {
++        (
++            (info.CommitTotal * info.PageSize) >> 20,
++            (info.CommitLimit * info.PageSize) >> 20,
++        )
++    })
++}
++
++fn adapter_budget_mib(adapter: &IDXGIAdapter3, segment: DXGI_MEMORY_SEGMENT_GROUP) -> Option<(u64, u64)> {
++    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
++    // SAFETY: a live adapter and a writable result for the primary GPU node.
++    unsafe { adapter.QueryVideoMemoryInfo(0, segment, &mut info) }.ok()?;
++    Some((info.CurrentUsage >> 20, info.Budget >> 20))
+ }
+ 
+ /// The swap chain formats a presented texture can be copied into: its own
+@@ -2684,7 +2751,7 @@ impl Host {
+         match made {
+             Ok(()) => Some((buffer?, data.cast())),
+             Err(e) => {
+-                tracing::warn!(error = %e, size, "no shared buffer");
++                self.report_buffer_failure("shared", size, &e);
+                 None
+             }
+         }

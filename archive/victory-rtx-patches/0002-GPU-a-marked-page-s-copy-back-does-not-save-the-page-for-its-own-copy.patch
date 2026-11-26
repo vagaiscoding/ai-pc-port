@@ -1,0 +1,42 @@
+From 940d32f69b22265690a0b5a15d6ded572ba33baf Mon Sep 17 00:00:00 2001
+From: Marvis <marvis@noreply.invalid>
+Date: Wed, 25 Nov 2026 02:22:06 +0100
+Subject: [PATCH] GPU: a marked page's copy-back does not save the page for its
+ own copy
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/victory-gpu/src/shadow.rs | 2 ++
+ crates/victory-gpu/src/watch.rs  | 6 ++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 39bda33..7c29f81 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -436,6 +436,8 @@ impl Shadow {
+         if from >= to {
+             return 0;
+         }
++        // Our own write below must not save the page for this copy again.
++        t.unarm(page / PAGE);
+         let saved = t.saved(page / PAGE);
+         if saved.is_none() && t.changed(page / PAGE) {
+             #[cfg(feature = "diagnostics")]
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 3d9393a..df74cc0 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -373,6 +373,12 @@ impl Tracked {
+         }
+     }
+ 
++    /// Page `page` (a page number) needs no saving any more: its copy-back
++    /// is under way.
++    pub(crate) fn unarm(&self, page: usize) {
++        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
++    }
++
+     /// No shader writes the copy any more: nothing is armed or kept.
+     pub(crate) fn disarm(&self) {
+         let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());

@@ -1,0 +1,54 @@
+From 407912487d4ebb040206dfb8084be955d5c091a2 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 10:27:29 +0100
+Subject: [PATCH] Use the host-target fields in GPU memory test fixtures
+
+---
+ .../src/emit/lower/mark_tests.rs               | 18 ++++++++++++++++--
+ crates/victory-shader/src/emit/memory_tests.rs |  3 +++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower/mark_tests.rs b/crates/victory-shader/src/emit/lower/mark_tests.rs
+index c11fa40..f088757 100644
+--- a/crates/victory-shader/src/emit/lower/mark_tests.rs
++++ b/crates/victory-shader/src/emit/lower/mark_tests.rs
+@@ -11,9 +11,23 @@ pub(in super::super) fn synthetic_mark_dxil(view_mark: bool, bytes: u32, in_bran
+     let p = crate::ir::build(&native.code, false, 1).expect("ir");
+     let st = crate::structure::structure(&p).expect("st");
+     let (res, io) = (crate::resource::track(&p, &[], HwStage::Cs, Some(&st)).expect("res"), crate::io::raise(&p, &native).expect("io"));
+-    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark };
++    let parts = Parts {
++        native: &native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        inputs: vec![],
++        outputs: vec![],
++        prims: vec![],
++        mesh_stride: 0,
++        target: Default::default(),
++        console_cf: false,
++        per_lane_only: false,
++        view_marks: view_mark,
++    };
+     let bad = HashMap::new();
+-    let mut l = Lower::new(&parts, &bad);
++    let mut l = Lower::new(&parts, &bad, false);
+     l.cur = l.s.entry;
+     let (z, iu) = (l.s.m.i32(0), l.s.m.undef(l.s.t.i32));
+     let at = in_branch.then(|| {
+diff --git a/crates/victory-shader/src/emit/memory_tests.rs b/crates/victory-shader/src/emit/memory_tests.rs
+index cd6eccf..0cfe70a 100644
+--- a/crates/victory-shader/src/emit/memory_tests.rs
++++ b/crates/victory-shader/src/emit/memory_tests.rs
+@@ -665,6 +665,9 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        target: Default::default(),
++        console_cf: false,
++        per_lane_only: false,
+         view_marks: false,
+     })
+     .expect("lower");

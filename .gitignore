@@ -1,0 +1,13 @@
+/local/
+/VIctory-Logs/
+/Streamline-*/
+/victory-game.lock
+/victory.toml
+*.log
+*.exe
+*.dll
+*.pdb
+*.zip
+*.rpf
+*.xvd
+/runtime/*/crates/victory-formats/src/bcpack-tables.bin

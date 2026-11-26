@@ -1,0 +1,81 @@
+//! D3D12.X on host D3D12.
+//!
+//! D3D12.X records commands from code inlined into the title, which writes
+//! packets into the command list while its put pointer is below a limit and
+//! calls the list's method otherwise. Our lists keep the limits at zero, so
+//! every command arrives here as a call, to be run on host D3D12. The
+//! title's GPU addresses are CPU addresses (console memory is unified).
+//!
+//! [`device`] is the device object titles create, [`dxgi`] its adapter side,
+//! [`resource`] heaps and resources, [`fence`] fences, [`queue`] command
+//! queues, [`list`] command allocators and lists, [`descriptor`]
+//! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
+//! [`signature`] command signatures, [`pipeline`] pipeline states,
+//! [`frame`] frame pacing, [`object`] what all console graphics objects
+//! share, [`console`] which console model the title sees, `external` host
+//! libraries recording into title lists. Planned:
+//! `present` (swap chain).
+
+#[cfg(windows)]
+mod bindless;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod capture;
+pub mod console;
+#[cfg(windows)]
+mod copy_pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod crumbs;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod copystat;
+pub mod descriptor;
+pub mod device;
+#[cfg(windows)]
+mod draw;
+#[cfg(windows)]
+pub mod dlss;
+pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
+pub mod fence;
+pub mod frame;
+#[cfg(windows)]
+mod host;
+#[cfg(windows)]
+mod indirect;
+pub mod list;
+#[cfg(windows)]
+mod memory;
+pub mod object;
+pub mod pipeline;
+#[cfg(windows)]
+mod primitive;
+pub mod query;
+pub mod queue;
+pub mod resource;
+#[cfg(windows)]
+pub mod rgb9e5;
+pub mod root;
+#[cfg(windows)]
+mod sampler;
+#[cfg(windows)]
+pub mod shader_cache;
+#[cfg(windows)]
+mod shadow;
+pub mod signature;
+mod switch;
+#[cfg(windows)]
+mod tdr;
+#[cfg(windows)]
+mod texture;
+#[cfg(windows)]
+mod twin;
+#[cfg(windows)]
+mod watch;
+
+#[cfg(windows)]
+pub use host::on_failure;
+#[cfg(windows)]
+pub use watch::{
+    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    writing as kernel_will_write,
+};

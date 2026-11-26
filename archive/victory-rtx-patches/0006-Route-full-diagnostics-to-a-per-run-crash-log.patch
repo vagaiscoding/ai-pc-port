@@ -1,0 +1,33 @@
+From 154d1080990d9a1f6a9ee21050e50120fa33c769 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Wed, 25 Nov 2026 14:49:57 +0100
+Subject: [PATCH] Route full diagnostics to a per-run crash log
+
+---
+ apps/victory/src/run.rs | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index 0cf045c..9fd1fcd 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -47,6 +47,10 @@ pub fn run(
+     use victory_hle::{HleResolver, HostPolicy};
+     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
+ 
++    let crash_log = std::env::var_os("VICTORY_CRASH_LOG")
++        .filter(|path| !path.is_empty())
++        .map(std::path::PathBuf::from);
++    tracing::trace!(title = %exe.display(), execute, ?crash_log, "title launch requested");
+     if execute {
+         check_cpu_features()?;
+     }
+@@ -169,7 +173,7 @@ pub fn run(
+         return Ok(0);
+     }
+     victory_loader::report_crashes();
+-    victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
++    victory_loader::log_crashes_to(crash_log.unwrap_or_else(|| temp.with_file_name("crashes.log")));
+     victory_hle::runtime::use_console_timers();
+     #[cfg(feature = "diagnostics")]
+     diagnostics(&image, &cfg);

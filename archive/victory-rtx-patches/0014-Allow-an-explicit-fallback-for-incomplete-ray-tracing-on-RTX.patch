@@ -1,0 +1,120 @@
+From 2c25037b73eb4297c1180a563d250acceb1537d7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 10:45:38 +0100
+Subject: [PATCH] Allow an explicit fallback for incomplete ray tracing on RTX
+
+---
+ crates/victory-gpu/src/draw.rs             |  4 ++++
+ crates/victory-gpu/src/pipeline.rs         | 18 +++++++++++++-----
+ crates/victory-gpu/src/pipeline/builder.rs | 15 ++++++++++++++-
+ 3 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index c306f51..db0bbee 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -474,6 +474,10 @@ impl State {
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+             return false;
+         }
++        if let Some(why) = crate::pipeline::held_back(self.pipeline as This) {
++            not_run(why);
++            return false;
++        }
+         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+             return false;
+         };
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index 2257d05..fe9d5a1 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -267,7 +267,11 @@ pub(crate) fn held_back(this: This) -> Option<&'static str> {
+     }
+     let p = pipeline(this);
+     if p.builder && !builder::runs() {
+-        return Some("the BVH builder held back: not all its pipelines are made");
++        return Some(if builder::disabled() {
++            "the BVH builder is disabled for this run"
++        } else {
++            "the BVH builder held back: not all its pipelines are made"
++        });
+     }
+     if p.walks_bvh && !builder::built() {
+         return Some("a BVH walk held back: the builder has not built its structures");
+@@ -284,6 +288,7 @@ fn walks_bvh(container: &[u8]) -> bool {
+         return false;
+     };
+     c.part(FourCC::DXIL)
++        .or_else(|| c.part(FourCC::ACCC))
+         .and_then(|part| victory_shader::native_programs(part.data).ok())
+         .is_some_and(|programs| programs.iter().any(|p| code_walks_bvh(&p.code)))
+ }
+@@ -824,14 +829,17 @@ mod tests {
+         });
+         assert!(refused, "the builder's pipeline was started");
+         assert_eq!(make::state(&pipeline(p).host), Some(false));
+-        assert!(
+-            held_back(p).is_some(),
+-            "one builder pipeline missing: the builder waits"
+-        );
++        let reason = if builder::disabled() {
++            "the BVH builder is disabled for this run"
++        } else {
++            "the BVH builder held back: not all its pipelines are made"
++        };
++        assert_eq!(held_back(p), Some(reason));
+         assert_eq!(held_back(other), None);
+         for q in [p, other] {
+             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+         }
++        builder::clear_image_for_tests();
+     }
+ 
+     /// Programs with `image_bvh_intersect_ray` or its 64-bit form walk the
+diff --git a/crates/victory-gpu/src/pipeline/builder.rs b/crates/victory-gpu/src/pipeline/builder.rs
+index 112d78e..52bd54a 100644
+--- a/crates/victory-gpu/src/pipeline/builder.rs
++++ b/crates/victory-gpu/src/pipeline/builder.rs
+@@ -39,6 +39,9 @@ pub fn note_title_dll(file: &str, base: usize, size: usize) {
+     if file.eq_ignore_ascii_case(FILE) {
+         tracing::info!(base = format_args!("{base:#x}"), size, "BVH builder mapped");
+         *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((base, base + size));
++        if disabled() {
++            tracing::info!("BVH building and traversal disabled for this run");
++        }
+     }
+ }
+ 
+@@ -46,6 +49,13 @@ fn image() -> Option<(usize, usize)> {
+     *IMAGE.lock().unwrap_or_else(|e| e.into_inner())
+ }
+ 
++/// Opt-in fallback for a title whose acceleration structures cannot be
++/// built correctly on this host.
++pub(crate) fn disabled() -> bool {
++    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *DISABLED.get_or_init(|| crate::switch::on("VICTORY_DISABLE_BVH"))
++}
++
+ /// The builder has run whole in some frame: its structures exist.
+ static BUILT: AtomicBool = AtomicBool::new(false);
+ 
+@@ -53,7 +63,7 @@ static BUILT: AtomicBool = AtomicBool::new(false);
+ /// whole once, or the title has no builder (its structures come from
+ /// elsewhere).
+ pub(crate) fn built() -> bool {
+-    BUILT.load(Ordering::Relaxed) || image().is_none()
++    (!disabled() && BUILT.load(Ordering::Relaxed)) || image().is_none()
+ }
+ 
+ /// Whether the pipeline being created is the builder's: `code` (the title's
+@@ -113,6 +123,9 @@ static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
+ /// Whether the builder's dispatches run in the current frame: decided once
+ /// per frame, so that a frame never runs part of the builder.
+ pub(crate) fn runs() -> bool {
++    if disabled() {
++        return false;
++    }
+     static SAID: AtomicBool = AtomicBool::new(false);
+     let frame = crate::frame::current();
+     let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());

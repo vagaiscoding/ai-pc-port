@@ -1,0 +1,65 @@
+From 7d73e2b249c975d0a6ffd1be0256b8ea8db63c4e Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 03:35:47 +0300
+Subject: [PATCH] pipeline: remove staging files when cache publication fails
+
+Reserve a new staging path and clean it up if writing or publishing fails. Cover a failed publication with a synthetic destination directory.
+---
+ crates/victory-pipeline/src/cache.rs | 33 ++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-pipeline/src/cache.rs b/crates/victory-pipeline/src/cache.rs
+index 1e4b7ec..81e57de 100644
+--- a/crates/victory-pipeline/src/cache.rs
++++ b/crates/victory-pipeline/src/cache.rs
+@@ -1,3 +1,4 @@
++use std::io::Write;
+ use std::path::{Path, PathBuf};
+ 
+ use anyhow::{Context, Result};
+@@ -58,8 +59,17 @@ impl Cache {
+         std::fs::create_dir_all(dir)?;
+         // Write-then-rename so readers never see partial output.
+         let tmp = tempfile_in(dir);
+-        std::fs::write(&tmp, &output)?;
+-        std::fs::rename(&tmp, &path)?;
++        let mut file = std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&tmp)?;
++        let written = file.write_all(&output);
++        drop(file);
++        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
++        if published.is_err() {
++            let _ = std::fs::remove_file(&tmp);
++        }
++        published?;
+         Ok(path)
+     }
+ }
+@@ -109,6 +119,25 @@ mod tests {
+         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+     }
+ 
++    #[test]
++    fn failed_publication_removes_the_staging_file() {
++        let tmp = tempfile::tempdir().unwrap();
++        let cache = Cache::open(tmp.path().join("cache")).unwrap();
++        let conv = Upper {
++            version: 1,
++            runs: AtomicUsize::new(0),
++        };
++        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
++        std::fs::create_dir_all(&path).unwrap();
++
++        assert!(cache.get_or_convert(&conv, b"abc").is_err());
++        assert!(path.is_dir());
++        assert_eq!(
++            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
++            1
++        );
++    }
++
+     #[test]
+     fn version_bump_invalidates() {
+         let v1 = Upper {

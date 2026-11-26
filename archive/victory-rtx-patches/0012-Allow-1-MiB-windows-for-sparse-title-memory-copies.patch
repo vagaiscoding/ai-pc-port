@@ -1,0 +1,36 @@
+From f68f615e6b60155c164d3bcedd299af11cf74daa Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Wed, 25 Nov 2026 20:53:19 +0100
+Subject: [PATCH] Allow 1 MiB windows for sparse title memory copies
+
+---
+ crates/victory-gpu/src/shadow.rs | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 7c29f81..e820969 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -875,8 +875,20 @@ const WINDOW: u64 = 4 << 20;
+ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+ 
+ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+-    let start = address & !(WINDOW - 1);
+-    let len = end.next_multiple_of(WINDOW) - start;
++    static WINDOW_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    let window = *WINDOW_BYTES.get_or_init(|| {
++        // Small reads of sparse title memory otherwise pin a full 4 MiB
++        // apiece in the CPU-visible D3D12 heap for the rest of the run.
++        let bytes = if crate::switch::on("VICTORY_SMALL_SHADOW_WINDOWS") {
++            1 << 20
++        } else {
++            WINDOW
++        };
++        tracing::info!(bytes, "title memory shadow window size");
++        bytes
++    });
++    let start = address & !(window - 1);
++    let len = end.checked_next_multiple_of(window)? - start;
+     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+     if let Some(shadow) = map.get(&(start, len)) {
+         return Some(shadow.clone());

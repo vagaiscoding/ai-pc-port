@@ -1,0 +1,354 @@
+From 2d0650aaf257c4be93790c7af2170e598ec4614c Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 26 Nov 2026 11:10:11 +0100
+Subject: [PATCH] Enable DLSS 4.5 Preset M and pass accurate host texture
+ states
+
+---
+ README.md                                    |   2 +
+ crates/victory-gpu/src/dlss.rs               |  47 ++++++---
+ crates/victory-gpu/src/resource.rs           | 100 ++++++++++++++-----
+ crates/victory-hle/src/modules/fidelityfx.rs |   5 +-
+ crates/victory-shader/src/emit/host.rs       |  11 +-
+ 5 files changed, 124 insertions(+), 41 deletions(-)
+
+diff --git a/README.md b/README.md
+index 89ac077..d4e91fe 100644
+--- a/README.md
++++ b/README.md
+@@ -101,6 +101,8 @@ On an NVIDIA RTX GPU, point `VICTORY_DLSS_DIR` at `bin\x64` of NVIDIA's
+ public [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline) (2.x)
+ instead: the same calls are answered by DLSS. The title still asks for
+ FSR's jitter sequence and render sizes, and gets FSR's answers.
++With Streamline 2.14.16, `VICTORY_DLSS_PRESET_M=1` requests the DLSS 4.5
++Super Resolution model (Preset M) at the title's chosen render size.
+ 
+ The window caption shows the framerate. Saves, settings and `crashes.log`
+ are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
+diff --git a/crates/victory-gpu/src/dlss.rs b/crates/victory-gpu/src/dlss.rs
+index 3e3b7c5..3655a6c 100644
+--- a/crates/victory-gpu/src/dlss.rs
++++ b/crates/victory-gpu/src/dlss.rs
+@@ -10,8 +10,8 @@
+ //! (`slSetD3DDevice`), with frame-based resource tagging. Each upscale
+ //! context the title creates is one Streamline viewport. A dispatch arrives
+ //! here after `victory_hle`'s FidelityFX module has swapped the title's
+-//! textures for their host copies (inputs in `NON_PIXEL_SHADER_RESOURCE`,
+-//! the output in `UNORDERED_ACCESS`; an RGB9E5 output the host cannot
++//! textures for their host copies and their states for D3D12 states
++//! (the output in `UNORDERED_ACCESS`; an RGB9E5 output the host cannot
+ //! store to is an FP16 texture of `crate::rgb9e5`'s by then) and its command
+ //! list for the host one, as it does for AMD's upscaler, so this only translates the
+ //! description: FidelityFX's jitter is DLSS's (both in pixels, the offset
+@@ -373,10 +373,14 @@ enum Mode {
+     UltraPerformance = 4,
+     Dlaa = 6,
+ }
+-// Host resource states the dispatch arrives with.
+-const HOST_UNORDERED_ACCESS: u32 = 0x8;
+-const HOST_NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+ 
++/// `sl::DLSSPreset` values used by this backend.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(u32)]
++enum Preset {
++    Default = 0,
++    M = 13,
++}
+ /// `sl::Preferences`.
+ #[repr(C)]
+ struct Preferences {
+@@ -536,8 +540,8 @@ struct Options {
+     indicator_invert_x: u8,
+     indicator_invert_y: u8,
+     /// DLAA, quality, balanced, performance, ultra performance and ultra
+-    /// quality presets; 0 is the default.
+-    presets: [u32; 6],
++    /// quality presets, in Streamline's field order.
++    presets: [Preset; 6],
+     use_auto_exposure: u8,
+     alpha_upscaling_enabled: u8,
+ }
+@@ -734,6 +738,7 @@ pub(super) struct Context {
+     viewport: u32,
+     flags: u32,
+     mode: Mode,
++    preset: Preset,
+ }
+ 
+ /// The DLSS mode for a context's largest upscale.
+@@ -781,6 +786,11 @@ fn create_on(
+         viewport: NEXT.fetch_add(1, Ordering::Relaxed),
+         flags: upscale.flags,
+         mode: mode_for(upscale.max_render, upscale.max_upscale),
++        preset: if crate::switch::on("VICTORY_DLSS_PRESET_M") {
++            Preset::M
++        } else {
++            Preset::Default
++        },
+     };
+     tracing::info!(
+         viewport = ctx.viewport,
+@@ -788,6 +798,7 @@ fn create_on(
+         upscale = ?upscale.max_upscale,
+         flags = upscale.flags,
+         mode = ?ctx.mode,
++        preset = ?ctx.preset,
+         "dlss: upscale context on the host GPU"
+     );
+     // SAFETY: the title's context pointer, checked for null by the caller.
+@@ -882,7 +893,7 @@ fn frame(ctx: &Context, d: &DispatchUpscale) -> Frame {
+         color_buffers_hdr: flag(ctx.flags & FFX_HDR != 0),
+         indicator_invert_x: FALSE,
+         indicator_invert_y: FALSE,
+-        presets: [0; 6],
++        presets: [ctx.preset; 6],
+         use_auto_exposure: flag(auto_exposure),
+         alpha_upscaling_enabled: FALSE,
+     };
+@@ -910,7 +921,8 @@ fn frame(ctx: &Context, d: &DispatchUpscale) -> Frame {
+ /// # Safety
+ ///
+ /// `context` is a context [`create`] made; `desc` an upscaling description
+-/// naming live host resources and an open host command list.
++/// naming live host resources in the supplied D3D12 states and an open host
++/// command list.
+ pub unsafe fn dispatch(context: *mut *mut c_void, desc: *const c_void) -> ReturnCode {
+     if context.is_null() || desc.is_null() {
+         return ERROR_PARAMETER;
+@@ -959,12 +971,8 @@ fn upscale(context: *mut *mut c_void, d: &DispatchUpscale) -> ReturnCode {
+             .tags
+             .iter()
+             .map(|&(_, slot, _)| {
+-                let state = if slot == OUTPUT {
+-                    HOST_UNORDERED_ACCESS
+-                } else {
+-                    HOST_NON_PIXEL_SHADER_RESOURCE
+-                };
+-                Resource::texture(d.resources[slot].resource, state)
++                let resource = d.resources[slot];
++                Resource::texture(resource.resource, resource.state)
+             })
+             .collect();
+         let tags: Vec<ResourceTag> = f
+@@ -997,7 +1005,7 @@ fn upscale(context: *mut *mut c_void, d: &DispatchUpscale) -> ReturnCode {
+     }
+     static FIRST: std::sync::Once = std::sync::Once::new();
+     FIRST.call_once(|| {
+-        tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, mode = ?ctx.mode, "dlss: first upscale recorded on the host GPU");
++        tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, mode = ?ctx.mode, preset = ?ctx.preset, "dlss: first upscale recorded on the host GPU");
+     });
+     OK
+ }
+@@ -1101,6 +1109,7 @@ mod tests {
+             viewport: 0,
+             flags: FFX_HDR | FFX_DEPTH_INVERTED | FFX_AUTO_EXPOSURE,
+             mode: Mode::MaxPerformance,
++            preset: Preset::M,
+         };
+         let mut d = dispatch_description();
+         d.jitter = [0.25, -0.125];
+@@ -1109,6 +1118,8 @@ mod tests {
+         d.upscale_size = [3840, 2160];
+         d.reset = true;
+         let f = frame(&ctx, &d);
++        assert_eq!(f.options.mode, Mode::MaxPerformance as u32);
++        assert_eq!(f.options.presets, [Preset::M; 6]);
+         assert_eq!(f.constants.jitter_offset, [0.25, -0.125]);
+         // UV-space vectors scaled to pixels by FSR are [-1, 1] for DLSS.
+         assert_eq!(f.constants.mvec_scale, [1.0, 1.0]);
+@@ -1316,6 +1327,10 @@ mod tests {
+                 d.resources[1].resource = inputs[1].0.as_raw();
+                 d.resources[2].resource = inputs[2].0.as_raw();
+                 d.resources[OUTPUT].resource = output.as_raw();
++                for resource in &mut d.resources[..3] {
++                    resource.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32;
++                }
++                d.resources[OUTPUT].state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+                 d.motion_vector_scale = [1.0, 1.0];
+                 d.render_size = render;
+                 d.upscale_size = upscale;
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 0930b28..9057f19 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -1058,10 +1058,7 @@ impl HostTexture {
+         state: u32,
+         castable: Vec<u32>,
+     ) -> Self {
+-        let bytes = crate::host::host().map_or(0, |h| {
+-            // SAFETY: plain queries on a live resource.
+-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
+-        });
++        let bytes = crate::host::host().map_or(0, |h| texture_bytes(&h.device, &texture, &castable));
+         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+         HostTexture {
+@@ -1383,11 +1380,7 @@ fn shared_texture(
+         && takes(t, &d)
+     {
+         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-        if let Some(host) = crate::host::host() {
+-            // SAFETY: a plain query on a host description (same layout).
+-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
+-            SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
+-        }
++        SAVED.fetch_add(t.bytes, std::sync::atomic::Ordering::Relaxed);
+         return live;
+     }
+     // shortcut: title textures of a replaced host texture keep it (placed
+@@ -1434,6 +1427,80 @@ fn current(this: This) -> bool {
+         .is_none_or(|live| std::sync::Arc::ptr_eq(&live, h))
+ }
+ 
++#[cfg(windows)]
++fn without_sampler_feedback(
++    desc: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
++) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1 {
++    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1;
++    D3D12_RESOURCE_DESC1 {
++        Dimension: desc.Dimension,
++        Alignment: desc.Alignment,
++        Width: desc.Width,
++        Height: desc.Height,
++        DepthOrArraySize: desc.DepthOrArraySize,
++        MipLevels: desc.MipLevels,
++        Format: desc.Format,
++        SampleDesc: desc.SampleDesc,
++        Layout: desc.Layout,
++        Flags: desc.Flags,
++        SamplerFeedbackMipRegion: Default::default(),
++    }
++}
++
++#[cfg(windows)]
++fn texture_bytes(
++    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
++    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
++    castable: &[u32],
++) -> u64 {
++    use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_DIMENSION_TEXTURE3D, ID3D12Device12};
++    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
++    use windows::core::Interface;
++
++    // SAFETY: a plain query on a live resource.
++    let desc = unsafe { texture.GetDesc() };
++    if castable.is_empty() {
++        // SAFETY: the texture was created from a plain resource description.
++        return unsafe { device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
++    }
++    if let Ok(device) = device.cast::<ID3D12Device12>() {
++        let formats: Vec<_> = castable.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
++        // SAFETY: one description and one array of its castable formats.
++        return unsafe {
++            device.GetResourceAllocationInfo3(
++                0,
++                1,
++                &without_sampler_feedback(desc),
++                Some(&(formats.len() as u32)),
++                Some(&formats.as_ptr()),
++                None,
++            )
++        }
++        .SizeInBytes;
++    }
++    // Older devices can report the copy footprint as an estimate for the log.
++    let layers = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
++        1
++    } else {
++        u32::from(desc.DepthOrArraySize)
++    };
++    let mut bytes = 0;
++    // SAFETY: a plain query with storage for the total footprint only.
++    unsafe {
++        device.GetCopyableFootprints(
++            &desc,
++            0,
++            u32::from(desc.MipLevels) * layers,
++            0,
++            None,
++            None,
++            None,
++            Some(&mut bytes),
++        );
++    }
++    bytes
++}
++
+ /// A host texture of host description `d` in GPU memory, castable to
+ /// [`castable`]'s formats (colour textures, through the enhanced-barrier
+ /// creation; it starts in the common state) where the host takes that.
+@@ -1468,20 +1535,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
+     {
+         // SAFETY: the description has the host layout (checked size).
+         let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+-        // The plain description plus the sampler feedback region (none).
+-        let desc1 = D3D12_RESOURCE_DESC1 {
+-            Dimension: p.Dimension,
+-            Alignment: p.Alignment,
+-            Width: p.Width,
+-            Height: p.Height,
+-            DepthOrArraySize: p.DepthOrArraySize,
+-            MipLevels: p.MipLevels,
+-            Format: p.Format,
+-            SampleDesc: p.SampleDesc,
+-            Layout: p.Layout,
+-            Flags: p.Flags,
+-            SamplerFeedbackMipRegion: Default::default(),
+-        };
++        let desc1 = without_sampler_feedback(p);
+         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+         // SAFETY: a host description and our out pointer; the list and the
+         // clear value live through the call.
+diff --git a/crates/victory-hle/src/modules/fidelityfx.rs b/crates/victory-hle/src/modules/fidelityfx.rs
+index 3f0dfbb..365597f 100644
+--- a/crates/victory-hle/src/modules/fidelityfx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx.rs
+@@ -488,7 +488,7 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+                 texture = Some((bridge.texture().clone(), wanted.unwrap_or(0)));
+             }
+         }
+-        let Some((texture, _)) = texture else {
++        let Some((texture, state)) = texture else {
+             once!(
+                 warn,
+                 state = r.state,
+@@ -497,6 +497,9 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+             return PARAMETER;
+         };
+         r.resource = texture.as_raw();
++        if host.is_none() {
++            r.state = state;
++        }
+         textures.push(texture);
+     }
+     once!(info, formats = ?textures.iter().map(|t| {
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index 52b3472..4042f1f 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -748,6 +748,15 @@ impl Host {
+                     ..Default::default()
+                 })
+                 .map_err(err)?;
++            // The generated root signature enables direct sampler indexing.
++            let samplers: ID3D12DescriptorHeap = dev
++                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
++                    NumDescriptors: 1,
++                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++                    ..Default::default()
++                })
++                .map_err(err)?;
+             dev.CreateUnorderedAccessView(
+                 &out,
+                 None,
+@@ -764,7 +773,7 @@ impl Host {
+                 }),
+                 views.GetCPUDescriptorHandleForHeapStart(),
+             );
+-            list.SetDescriptorHeaps(&[Some(views.clone())]);
++            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
+             list.SetComputeRootSignature(&root);
+             list.SetComputeRoot32BitConstants(
+                 0,

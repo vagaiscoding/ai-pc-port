@@ -1,0 +1,124 @@
+From bcd0d3d679e1a55a0d07fd3d83d04875d8f65834 Mon Sep 17 00:00:00 2001
+From: Sleither Reyes <sleither.reyes@gmx.de>
+Date: Wed, 25 Nov 2026 01:22:35 +0100
+Subject: [PATCH] GPU tests: a table made afresh has its view addresses at its
+ dynamic slots
+
+The test reads an entry only inside the view addresses' buffer (none past it, where the buffer had an entry per title slot only), checks the slot's entry before it is made, after, once it is given back (it stays until the slot is made again: every table made afresh makes all its slots) and once it is made null, checks that a root view and a host copy's view pair made in dynamic slots clear the entries an earlier table left there, and puts a mark past the last entry that a view address noted for a slot past the dynamic ones leaves as it is. It takes any heap size the host gives: a title heap of 4 slots has dynamic slots past it either way.
+---
+ crates/victory-gpu/src/descriptor/host.rs | 95 +++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 512e5e7..a3bb36e 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -589,6 +589,20 @@ impl HostHeap {
+         }
+     }
+ 
++    /// The view address entered for slot `index`; none for a slot past the
++    /// view addresses' buffer (tests).
++    #[cfg(test)]
++    fn address_at(&self, index: u32) -> Option<u64> {
++        let (buffer, data, _) = self.addresses.get()?.as_ref()?;
++        // SAFETY: a live buffer.
++        if 8 * u64::from(index) + 8 > unsafe { buffer.GetDesc() }.Width {
++            return None;
++        }
++        // SAFETY: an entry of the mapped view addresses (checked).
++        let [lo, hi] = unsafe { ((data + 8 * index as usize) as *const [u32; 2]).read_unaligned() };
++        Some(u64::from(hi) << 32 | u64::from(lo))
++    }
++
+     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
+     /// resource view and a raw unordered access view of the first `bytes`
+     /// (a multiple of 4) of `buffer`, which they hold; null views for no
+@@ -1504,6 +1518,87 @@ mod tests {
+         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+     }
+ 
++    /// A table made afresh lies in dynamic slots, and a shader reading a
++    /// view's address (e.g. the BVH builder's base) indexes the view
++    /// addresses there: they have an entry for each dynamic slot, entered
++    /// whenever the slot is made (a view, null, or a raw view of ours).
++    /// Giving a slot back leaves its entry: every table made afresh makes
++    /// all its slots. (Hosts whose view heaps are smaller than the title's,
++    /// NVIDIA, make such tables; the shader read past the buffer.)
++    ///
++    /// Any heap size the host takes will do: a title heap of 4 slots leaves
++    /// dynamic slots past it either way ([`DYNAMIC`] or [`MIN_DYNAMIC`]).
++    #[test]
++    fn view_addresses_cover_tables_made_afresh() {
++        let Some(heap) = HostHeap::new(false, 4) else {
++            return; // no host GPU
++        };
++        let end = heap.count() + heap.dynamic;
++        assert!(heap.view_addresses().is_some());
++        let first = heap.dynamic(2).unwrap();
++        assert!(first >= heap.count() && first + 1 < end);
++        // A buffer the title placed at 0xd_6013_e000: 16 elements of 4 bytes.
++        let address = 0xd_6013_e000u64;
++        let mut resource = [0u32; 14];
++        (resource[0], resource[4]) = (1, 64);
++        let mut desc = [0u32; 16];
++        (desc[1], desc[2], desc[6], desc[7]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
++        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
++        let view = View::Placed(false, resource, desc);
++        assert_eq!(buffer_range(&view), Some((address, 64)));
++        assert_eq!(heap.address_at(first), Some(0), "not made yet");
++        heap.make_at(first, &view);
++        assert_eq!(heap.address_at(first), Some(address));
++        assert_eq!(heap.address_at(first + 1), Some(0), "not made yet");
++        // The last dynamic slot has its entry too.
++        heap.make_at(end - 1, &view);
++        assert_eq!(heap.address_at(end - 1), Some(address));
++        // A slot given back keeps its entry until it is made again; made
++        // null, it has its entry cleared.
++        heap.release(first, 2);
++        assert_eq!(
++            heap.address_at(first),
++            Some(address),
++            "given back, not made"
++        );
++        heap.make_null(first);
++        assert_eq!(heap.address_at(first), Some(0));
++        assert_eq!(heap.address_at(end - 1), Some(address), "still made");
++        // Raw views of ours (root views, host copies' view pairs) in dynamic
++        // slots clear what an earlier table entered there.
++        heap.make_at(first, &view);
++        heap.raw_view_at(first, None, 0, 0, false);
++        assert_eq!(heap.address_at(first), Some(0), "a root view");
++        heap.make_at(first, &view);
++        heap.make_at(first + 1, &view);
++        heap.raw_pair_at(first, None, 0);
++        assert_eq!(heap.address_at(first), Some(0), "a view pair");
++        assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
++        // Slots past the dynamic ones (host copies' view pairs) have no
++        // entry, and nothing is written past the last: a mark there (the
++        // buffer's allocation reaches past it) stays.
++        assert_eq!(heap.address_at(end), None);
++        let host = host().unwrap();
++        let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
++        // SAFETY: plain queries of a live buffer.
++        let (desc, size) = unsafe {
++            let desc = buffer.GetDesc();
++            let info = host.device.GetResourceAllocationInfo(0, &[desc]);
++            (desc, info.SizeInBytes)
++        };
++        assert_eq!(desc.Width, 8 * u64::from(end));
++        assert!(size >= desc.Width + 8, "room for the mark");
++        let past = (data + 8 * end as usize) as *mut u64;
++        let mark = 0x5a5a_5a5a_5a5a_5a5a;
++        // SAFETY: mapped memory of the buffer's allocation (checked).
++        unsafe { past.write_unaligned(mark) };
++        heap.note_address(end, Some(&view));
++        // SAFETY: as above.
++        assert_eq!(unsafe { past.read_unaligned() }, mark);
++        // SAFETY: a plain device query.
++        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
++    }
++
+     /// Dynamic slots stay taken until given back, and runs do not wrap.
+     #[test]
+     fn dynamic_slots_are_held_until_released() {
