@@ -30,3 +30,7 @@ The 262,144-slot descriptor reserve experiment removed slot-exhaustion warnings 
 - For performance, measure preparation and GPU time independently. Keep each proposed change in a separate commit so both collaborators can reproduce its effect on the same scene.
 
 Share a short, redacted symptom and timings in GitHub. Keep raw logs and game-derived captures local.
+
+## RTX 5070 performance follow-up
+
+The controlled CGBJ comparison and remaining GPU-memory bottleneck are recorded in [CGBJ-PERFORMANCE-RTX5070.md](CGBJ-PERFORMANCE-RTX5070.md). The warmed indoor scene remains around 5 FPS; the two texture settings tested did not improve it. Keep the launcher defaults until a measured change wins.
