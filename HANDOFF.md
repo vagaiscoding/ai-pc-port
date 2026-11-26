@@ -34,3 +34,9 @@ Share a short, redacted symptom and timings in GitHub. Keep raw logs and game-de
 ## RTX 5070 performance follow-up
 
 The controlled CGBJ comparison and remaining GPU-memory bottleneck are recorded in [CGBJ-PERFORMANCE-RTX5070.md](CGBJ-PERFORMANCE-RTX5070.md). The warmed indoor scene remains around 5 FPS; the two texture settings tested did not improve it. Keep the launcher defaults until a measured change wins.
+
+## DualShock 4 input follow-up
+
+The CGBJ `gameinput` host now has an opt-in Windows joystick slot. `Play-CGBJ.cmd` selects joystick index 0 for the connected Sony DualShock 4 USB device. A Windows capture observed the face buttons, shoulders, D-pad, both trigger axes, and both stick axes. The focused conversion test passed; a release build and a brief title launch logged `Windows joystick connection changed id=0 connected=true`. Full in-game button and movement behavior still needs a hands-on check. WinMM provides no rumble in this implementation.
+
+The latest Task Manager capture showed 100% 3D utilization, 11.4 of 12.0 GB dedicated GPU memory, 6.0 of 7.9 GB shared GPU memory, and 14.8 of 15.8 GB system RAM. The GPU was 45 C. These readings support GPU and memory pressure as a performance concern; they do not identify a single fix or establish that temperature is limiting FPS.

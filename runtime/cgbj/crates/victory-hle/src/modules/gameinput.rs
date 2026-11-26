@@ -1,5 +1,5 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3) or an optional Windows joystick (slot 4); the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -52,7 +52,9 @@ const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
-const PADS: usize = 4;
+const XINPUT_PADS: usize = 4;
+const WINMM_PAD: usize = XINPUT_PADS;
+const PADS: usize = XINPUT_PADS + 1;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
@@ -228,7 +230,11 @@ impl Device {
             root_id: id,
             supported_input: kind(index),
             // Low and high frequency.
-            rumble_motors: if index <= FALLBACK { 0x3 } else { 0 },
+            rumble_motors: if index < XINPUT_PADS || index == FALLBACK {
+                0x3
+            } else {
+                0
+            },
             ..Default::default()
         };
         Device {
@@ -1119,6 +1125,7 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Media::Multimedia::{JOYERR_NOERROR, JOYINFOEX, joyGetPosEx};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1139,6 +1146,72 @@ mod host {
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
+
+    /// Windows exposes an unremapped DualShock 4 as a joystick, not as XInput.
+    /// Explicit opt-in avoids accidentally assigning an unrelated joystick
+    /// (or a remapper's duplicate device) to the game's first player.
+    static WINMM_ID: LazyLock<Option<u32>> = LazyLock::new(|| {
+        std::env::var("VICTORY_WINMM_PAD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    });
+
+    /// Windows joystick button order for the DualShock 4 USB HID device.
+    const DS4_BUTTONS: [(u32, u32); 10] = [
+        (1, X),               // Square
+        (2, A),               // Cross
+        (4, B),               // Circle
+        (8, Y),               // Triangle
+        (16, LEFT_SHOULDER),  // L1
+        (32, RIGHT_SHOULDER), // R1
+        (256, VIEW),          // Share
+        (512, MENU),          // Options
+        (1024, LEFT_STICK),   // L3
+        (2048, RIGHT_STICK),  // R3
+    ];
+
+    fn convert_winmm(joystick: &JOYINFOEX) -> PadState {
+        // The observed DS4 reports four centered 16-bit stick axes and two
+        // 0..65535 trigger axes. A dead zone removes idle HID jitter.
+        let stick = |raw: u32| {
+            let value = (raw.min(65535) as f32 / 32767.5 - 1.0).clamp(-1.0, 1.0);
+            if value.abs() < 0.12 {
+                0.0
+            } else {
+                value.signum() * (value.abs() - 0.12) / 0.88
+            }
+        };
+        let raw_buttons = joystick.dwButtons;
+        let pov = joystick.dwPOV;
+        let mut buttons = DS4_BUTTONS
+            .iter()
+            .filter(|(raw, _)| raw_buttons & raw != 0)
+            .fold(0, |all, (_, mapped)| all | mapped);
+        if pov < 36000 {
+            if pov >= 31500 || pov <= 4500 {
+                buttons |= UP;
+            }
+            if (4500..=13500).contains(&pov) {
+                buttons |= RIGHT;
+            }
+            if (13500..=22500).contains(&pov) {
+                buttons |= DOWN;
+            }
+            if (22500..=31500).contains(&pov) {
+                buttons |= LEFT;
+            }
+        }
+        PadState {
+            buttons,
+            // The captured DS4 reports L2/button 7 on V and R2/button 8 on U.
+            left_trigger: joystick.dwVpos.min(65535) as f32 / 65535.0,
+            right_trigger: joystick.dwUpos.min(65535) as f32 / 65535.0,
+            left_x: stick(joystick.dwXpos),
+            left_y: -stick(joystick.dwYpos),
+            right_x: stick(joystick.dwZpos),
+            right_y: -stick(joystick.dwRpos),
+        }
+    }
 
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
@@ -1176,11 +1249,27 @@ mod host {
 
     #[derive(Default)]
     pub(super) struct Host {
-        empty_until: [Option<Instant>; PADS],
+        empty_until: [Option<Instant>; XINPUT_PADS],
+        winmm_connected: bool,
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if slot == WINMM_PAD {
+                let id = (*WINMM_ID)?;
+                let mut joystick = JOYINFOEX {
+                    dwSize: size_of::<JOYINFOEX>() as u32,
+                    dwFlags: 0xff, // axes, buttons and POV
+                    ..Default::default()
+                };
+                // SAFETY: the API writes to the fully initialized structure.
+                let connected = unsafe { joyGetPosEx(id, &mut joystick) } == JOYERR_NOERROR;
+                if connected != self.winmm_connected {
+                    tracing::info!(id, connected, "Windows joystick connection changed");
+                    self.winmm_connected = connected;
+                }
+                return connected.then(|| convert_winmm(&joystick));
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1232,6 +1321,9 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            if slot == WINMM_PAD {
+                return; // WinMM does not provide controller vibration.
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
@@ -1312,6 +1404,35 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    #[test]
+    fn ds4_buttons_axes_and_pov_convert_to_console_pad() {
+        let joystick = JOYINFOEX {
+            dwButtons: 2 | 16 | 512, // Cross, L1, Options
+            dwPOV: 4500,             // up and right
+            dwXpos: 0,
+            dwYpos: 65535,
+            dwZpos: 32768,
+            dwRpos: 32768,
+            dwVpos: 65535,
+            ..Default::default()
+        };
+        let pad = convert_winmm(&joystick);
+        assert_eq!(pad.buttons, A | LEFT_SHOULDER | MENU | UP | RIGHT);
+        assert_eq!((pad.left_trigger, pad.left_x, pad.left_y), (1.0, -1.0, -1.0));
+        assert_eq!((pad.right_x, pad.right_y), (0.0, 0.0));
+
+        let joystick = JOYINFOEX {
+            dwButtons: 1 | 4 | 8 | 32 | 128 | 256,
+            dwPOV: 18000,
+            dwUpos: 65535,
+            dwVpos: 0,
+            ..joystick
+        };
+        let pad = convert_winmm(&joystick);
+        assert_eq!(pad.buttons, X | B | Y | RIGHT_SHOULDER | VIEW | DOWN);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 1.0));
     }
 }
 

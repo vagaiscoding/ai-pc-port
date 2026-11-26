@@ -23,6 +23,8 @@ $env:VICTORY_GAME_DIR = 'D:\Games\YourDump'
 
 `Play-CGBJ.cmd` uses the upstream Pareto Residency preset and Series S. The CGBJ and RTX launchers use separate local caches and save folders.
 
+The CGBJ launcher also enables native PlayStation 4 controller input through Windows joystick slot 0. Cross acts as A, Circle as B, Square as X, Triangle as Y, and Options as Menu. Set `VICTORY_WINMM_PAD` to another Windows joystick index if the controller is on a different slot; leave it unset when running CGBJ directly to disable this path. XInput controllers still work. The Windows joystick path does not provide controller vibration.
+
 - `VIctory-RTX-GPU-Fix.cmd --check` checks the title's imports without running the game. Omit `--check` to play.
 - `VIctory-DLSS-Performance.cmd` uses DLSS Preset M on the Series S profile. Set `VICTORY_DLSS_DIR` to the `bin\x64` folder of your own NVIDIA Streamline 2.14.16 SDK installation.
 - `VIctory-DLSS-4.5.cmd` retains the earlier DLSS diagnostic launcher. Both DLSS launchers support `--check`, `--gpu-log`, and `--full-log`. Full logging slows the run.
